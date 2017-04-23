@@ -120,10 +120,11 @@ static enum trace_type opt_type = TRACE_UDP;
 int opt_port = TRACE_UDP_PORT;
 int opt_max_hops = 64;
 static int opt_max_tries = 3;
-int opt_resolve_hostnames = 0;
+int opt_resolve_hostnames = 1;
 int opt_tos = -1;	/* Triggers with non-negative values.  */
 int opt_ttl = TRACE_TTL;
 int opt_wait = TIME_INTERVAL;
+int opt_show_ipip = 1;
 #ifdef IP_OPTIONS
 char *opt_gateways = NULL;
 #endif
@@ -135,10 +136,6 @@ const char *program_authors[] = {
 	NULL
 };
 
-/* Define keys for long options that do not have short counterparts. */
-enum {
-  OPT_RESOLVE = 256
-};
 
 static struct argp_option argp_options[] = {
 #define GRP 0
@@ -152,7 +149,7 @@ static struct argp_option argp_options[] = {
   {"max-hop", 'm', "NUM", 0, "set maximal hop count (default: 64)", GRP+1},
   {"port", 'p', "PORT", 0, "use destination PORT port (default: 33434)",
    GRP+1},
-  {"resolve-hostnames", OPT_RESOLVE, NULL, 0, "resolve hostnames", GRP+1},
+  {"no-resolve-hostnames", 'n', NULL, 0, "do not resolve hostnames", GRP+1},
   {"tos", 't', "NUM", 0, "set type of service (TOS) to NUM", GRP+1},
   {"tries", 'q', "NUM", 0, "send NUM probe packets per hop (default: 3)",
    GRP+1},
@@ -160,6 +157,9 @@ static struct argp_option argp_options[] = {
    "operations, defaulting to `udp'", GRP+1},
   {"wait", 'w', "NUM", 0, "wait NUM seconds for response (default: 3)",
    GRP+1},
+  {"no-ipip-geolocation", 'y', NULL, 0, "do not show ipip geolocation",
+   GRP+1},
+
 #undef GRP
   {NULL, 0, NULL, 0, NULL, 0}
 };
@@ -244,8 +244,12 @@ parse_opt (int key, char *arg, struct argp_state *state)
 	error (EXIT_FAILURE, 0, "ridiculous waiting time `%s'", arg);
       break;
 
-    case OPT_RESOLVE:
-      opt_resolve_hostnames = 1;
+    case 'n':
+      opt_resolve_hostnames = 0;
+      break;
+
+    case 'y':
+      opt_show_ipip = 0;
       break;
 
     case ARGP_KEY_ARG:
@@ -350,6 +354,95 @@ main (int argc, char **argv)
   exit (EXIT_SUCCESS);
 }
 
+typedef unsigned char byte;
+typedef unsigned int uint;
+#define B2IL(b) (((b)[0] & 0xFF) | (((b)[1] << 8) & 0xFF00) | (((b)[2] << 16) & 0xFF0000) | (((b)[3] << 24) & 0xFF000000))
+#define B2IU(b) (((b)[3] & 0xFF) | (((b)[2] << 8) & 0xFF00) | (((b)[1] << 16) & 0xFF0000) | (((b)[0] << 24) & 0xFF000000))
+
+struct {
+    byte *data;
+    byte *index;
+    uint *flag;
+    uint offset;
+} ipip;
+
+int ipipdb_destroy() {
+    if (!ipip.offset) {
+        return 0;
+    }
+    free(ipip.flag);
+    free(ipip.index);
+    free(ipip.data);
+    ipip.offset = 0;
+    return 0;
+}
+
+int ipipdb_init(const char *ipdb) {
+    if (ipip.offset) {
+        return 0;
+    }
+    FILE *file = fopen(ipdb, "rb");
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    ipip.data = (byte *) malloc(size * sizeof(byte));
+    size_t r = fread(ipip.data, sizeof(byte), (size_t) size, file);
+
+    if (r == 0) {
+        return 0;
+    }
+
+    fclose(file);
+
+    uint length = B2IU(ipip.data);
+
+    ipip.index = (byte *) malloc(length * sizeof(byte));
+    memcpy(ipip.index, ipip.data + 4, length);
+
+    ipip.offset = length;
+
+    ipip.flag = (uint *) malloc(256 * sizeof(uint));
+    memcpy(ipip.flag, ipip.index, 256 * sizeof(uint));
+
+    return 0;
+}
+
+int ipipdb_find(const uint32_t ip, char *result) {
+    uint ip_prefix_value = (ip & 0xFF000000) >> 24;
+    uint start = ipip.flag[ip_prefix_value];
+    uint max_comp_len = ipip.offset - 1028;
+    uint index_offset = 0;
+    uint index_length = 0;
+    for (start = start * 8 + 1024; start < max_comp_len; start += 8) {
+        if (B2IU(ipip.index + start) >= ip) {
+            index_offset = B2IL(ipip.index + start + 4) & 0x00FFFFFF;
+            index_length = ipip.index[start + 7];
+            break;
+        }
+    }
+    memcpy(result, ipip.data + ipip.offset + index_offset - 1024, index_length);
+    result[index_length] = '\0';
+    for (int i = 0; i < index_length; i++) {
+        if (result[i] == '\t') {
+            result[i] = ' ';
+        }
+    }
+    return 0;
+}
+
+
+static const char *ipip_get_location(struct in_addr *ip) {
+    ipipdb_init("/usr/local/share/17monipdb.dat");
+    static char buf[192];
+    buf[0] = '\0';
+    uint32_t res_ip = htonl(ip->s_addr);
+    strcpy(buf, " [");
+    ipipdb_find(res_ip, buf + 2);
+    strcat(buf, "]");
+    return buf;
+}
+
 void
 do_try (trace_t * trace, const int hop,
 	const int max_hops _GL_UNUSED_PARAMETER,
@@ -436,6 +529,8 @@ do_try (trace_t * trace, const int hop,
 		      if (opt_resolve_hostnames)
 			printf ("(%s) ",
 			    get_hostname (&trace->from.sin_addr));
+          if (opt_show_ipip)
+          printf("%s", ipip_get_location(&trace->from.sin_addr));
 		    }
 		  printf (" %.3fms ", triptime);
 

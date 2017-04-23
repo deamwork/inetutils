@@ -65,6 +65,97 @@ void print_icmp_header (struct sockaddr_in *from,
 			struct ip *ip, icmphdr_t * icmp, int len);
 static void print_ip_opt (struct ip *ip, int hlen);
 
+
+typedef unsigned char byte;
+typedef unsigned int uint;
+#define B2IL(b) (((b)[0] & 0xFF) | (((b)[1] << 8) & 0xFF00) | (((b)[2] << 16) & 0xFF0000) | (((b)[3] << 24) & 0xFF000000))
+#define B2IU(b) (((b)[3] & 0xFF) | (((b)[2] << 8) & 0xFF00) | (((b)[1] << 16) & 0xFF0000) | (((b)[0] << 24) & 0xFF000000))
+
+struct {
+    byte *data;
+    byte *index;
+    uint *flag;
+    uint offset;
+} ipip;
+
+int ipipdb_destroy() {
+    if (!ipip.offset) {
+        return 0;
+    }
+    free(ipip.flag);
+    free(ipip.index);
+    free(ipip.data);
+    ipip.offset = 0;
+    return 0;
+}
+
+int ipipdb_init(const char *ipdb) {
+    if (ipip.offset) {
+        return 0;
+    }
+    FILE *file = fopen(ipdb, "rb");
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    ipip.data = (byte *) malloc(size * sizeof(byte));
+    size_t r = fread(ipip.data, sizeof(byte), (size_t) size, file);
+
+    if (r == 0) {
+        return 0;
+    }
+
+    fclose(file);
+
+    uint length = B2IU(ipip.data);
+
+    ipip.index = (byte *) malloc(length * sizeof(byte));
+    memcpy(ipip.index, ipip.data + 4, length);
+
+    ipip.offset = length;
+
+    ipip.flag = (uint *) malloc(256 * sizeof(uint));
+    memcpy(ipip.flag, ipip.index, 256 * sizeof(uint));
+
+    return 0;
+}
+
+int ipipdb_find(const uint32_t ip, char *result) {
+    uint ip_prefix_value = (ip & 0xFF000000) >> 24;
+    uint start = ipip.flag[ip_prefix_value];
+    uint max_comp_len = ipip.offset - 1028;
+    uint index_offset = 0;
+    uint index_length = 0;
+    for (start = start * 8 + 1024; start < max_comp_len; start += 8) {
+        if (B2IU(ipip.index + start) >= ip) {
+            index_offset = B2IL(ipip.index + start + 4) & 0x00FFFFFF;
+            index_length = ipip.index[start + 7];
+            break;
+        }
+    }
+    memcpy(result, ipip.data + ipip.offset + index_offset - 1024, index_length);
+    result[index_length] = '\0';
+    for (int i = 0; i < index_length; i++) {
+        if (result[i] == '\t') {
+            result[i] = ' ';
+        }
+    }
+    return 0;
+}
+
+
+static const char *ipip_get_location(struct in_addr *ip) {
+    ipipdb_init("/usr/local/share/17monipdb.dat");
+    static char buf[192];
+    buf[0] = '\0';
+    uint32_t res_ip = htonl(ip->s_addr);
+    strcpy(buf, " [");
+    ipipdb_find(res_ip, buf + 2);
+    strcat(buf, "]");
+    return buf;
+}
+
+
 int
 ping_echo (char *hostname)
 {
@@ -140,9 +231,11 @@ ping_echo (char *hostname)
 #endif /* IP_OPTIONS */
     }
 
-  printf ("PING %s (%s): %zu data bytes",
+  printf ("PING %s (%s)%s: %zu data bytes",
 	  ping->ping_hostname,
-	  inet_ntoa (ping->ping_dest.ping_sockaddr.sin_addr), data_length);
+	  inet_ntoa (ping->ping_dest.ping_sockaddr.sin_addr),
+    ipip_get_location(&ping->ping_dest.ping_sockaddr.sin_addr),
+    data_length);
   if (options & OPT_VERBOSE)
     printf (", id 0x%04x = %u", ping->ping_ident, ping->ping_ident);
 
